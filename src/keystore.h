@@ -6,15 +6,20 @@
 #define BITCOIN_KEYSTORE_H
 
 #include "crypter.h"
-#include "script.h"
+#include "util.h"
+#include "base58.h"
 
-// A virtual base class for key stores
+class CScript;
+
+/** A virtual base class for key stores */
 class CKeyStore
 {
 protected:
     mutable CCriticalSection cs_KeyStore;
 
 public:
+    virtual ~CKeyStore() {}
+
     // Add a key to the store.
     virtual bool AddKey(const CKey& key) =0;
 
@@ -42,7 +47,7 @@ public:
 typedef std::map<CBitcoinAddress, std::pair<CSecret, bool> > KeyMap;
 typedef std::map<uint160, CScript > ScriptMap;
 
-// Basic key store, that keeps keys in an address->secret map
+/** Basic key store, that keeps keys in an address->secret map */
 class CBasicKeyStore : public CKeyStore
 {
 protected:
@@ -54,15 +59,17 @@ public:
     bool HaveKey(const CBitcoinAddress &address) const
     {
         bool result;
-        CRITICAL_BLOCK(cs_KeyStore)
+        {
+            LOCK(cs_KeyStore);
             result = (mapKeys.count(address) > 0);
+        }
         return result;
     }
     void GetKeys(std::set<CBitcoinAddress> &setAddress) const
     {
         setAddress.clear();
-        CRITICAL_BLOCK(cs_KeyStore)
         {
+            LOCK(cs_KeyStore);
             KeyMap::const_iterator mi = mapKeys.begin();
             while (mi != mapKeys.end())
             {
@@ -73,8 +80,8 @@ public:
     }
     bool GetKey(const CBitcoinAddress &address, CKey &keyOut) const
     {
-        CRITICAL_BLOCK(cs_KeyStore)
         {
+            LOCK(cs_KeyStore);
             KeyMap::const_iterator mi = mapKeys.find(address);
             if (mi != mapKeys.end())
             {
@@ -92,8 +99,9 @@ public:
 
 typedef std::map<CBitcoinAddress, std::pair<std::vector<unsigned char>, std::vector<unsigned char> > > CryptedKeyMap;
 
-// Keystore which keeps the private keys encrypted
-// It derives from the basic key store, which is used if no encryption is active.
+/** Keystore which keeps the private keys encrypted.
+ * It derives from the basic key store, which is used if no encryption is active.
+ */
 class CCryptoKeyStore : public CBasicKeyStore
 {
 private:
@@ -128,8 +136,10 @@ public:
         if (!IsCrypted())
             return false;
         bool result;
-        CRITICAL_BLOCK(cs_KeyStore)
+        {
+            LOCK(cs_KeyStore);
             result = vMasterKey.empty();
+        }
         return result;
     }
 
@@ -138,8 +148,10 @@ public:
         if (!SetCrypted())
             return false;
 
-        CRITICAL_BLOCK(cs_KeyStore)
+        {
+            LOCK(cs_KeyStore);
             vMasterKey.clear();
+        }
 
         return true;
     }
@@ -148,8 +160,8 @@ public:
     bool AddKey(const CKey& key);
     bool HaveKey(const CBitcoinAddress &address) const
     {
-        CRITICAL_BLOCK(cs_KeyStore)
         {
+            LOCK(cs_KeyStore);
             if (!IsCrypted())
                 return CBasicKeyStore::HaveKey(address);
             return mapCryptedKeys.count(address) > 0;

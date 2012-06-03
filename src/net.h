@@ -17,6 +17,7 @@
 #include "mruset.h"
 #include "netbase.h"
 #include "protocol.h"
+#include "addrman.h"
 
 class CAddrDB;
 class CRequestTracker;
@@ -28,17 +29,13 @@ extern int nBestHeight;
 
 inline unsigned int ReceiveBufferSize() { return 1000*GetArg("-maxreceivebuffer", 10*1000); }
 inline unsigned int SendBufferSize() { return 1000*GetArg("-maxsendbuffer", 10*1000); }
-static const unsigned int PUBLISH_HOPS = 5;
 
 bool RecvLine(SOCKET hSocket, std::string& strLine);
 bool GetMyExternalIP(CNetAddr& ipRet);
-bool AddAddress(CAddress addr, int64 nTimePenalty=0, CAddrDB *pAddrDB=NULL);
 void AddressCurrentlyConnected(const CService& addr);
 CNode* FindNode(const CNetAddr& ip);
 CNode* FindNode(const CService& ip);
 CNode* ConnectNode(CAddress addrConnect, int64 nTimeout=0);
-void AbandonRequests(void (*fn)(void*, CDataStream&), void* param1);
-bool AnySubscribed(unsigned int nChannel);
 void MapPort(bool fMapPort);
 bool BindListenPort(std::string& strError=REF(std::string()));
 void StartNode(void* parg);
@@ -69,7 +66,7 @@ public:
 };
 
 
-
+/** Thread types */
 enum threadId
 {
     THREAD_SOCKETHANDLER,
@@ -80,6 +77,7 @@ enum threadId
     THREAD_UPNP,
     THREAD_DNSSEED,
     THREAD_ADDEDCONNECTIONS,
+    THREAD_DUMPADDRESS,
 
     THREAD_MAX
 };
@@ -90,11 +88,10 @@ extern uint64 nLocalServices;
 extern CAddress addrLocalHost;
 extern uint64 nLocalHostNonce;
 extern boost::array<int, THREAD_MAX> vnThreadsRunning;
+extern CAddrMan addrman;
 
 extern std::vector<CNode*> vNodes;
 extern CCriticalSection cs_vNodes;
-extern std::map<std::vector<unsigned char>, CAddress> mapAddresses;
-extern CCriticalSection cs_mapAddresses;
 extern std::map<CInv, CDataStream> mapRelay;
 extern std::deque<std::pair<int64, CInv> > vRelayExpiration;
 extern CCriticalSection cs_mapRelay;
@@ -105,7 +102,7 @@ extern std::map<CInv, int64> mapAlreadyAskedFor;
 
 
 
-
+/** Information about a peer */
 class CNode
 {
 public:
@@ -120,7 +117,7 @@ public:
     int64 nLastRecv;
     int64 nLastSendEmpty;
     int64 nTimeConnected;
-    unsigned int nHeaderStart;
+    int nHeaderStart;
     unsigned int nMessageStart;
     CAddress addr;
     int nVersion;
@@ -130,6 +127,7 @@ public:
     bool fNetworkNode;
     bool fSuccessfullyConnected;
     bool fDisconnect;
+    bool fHasGrant; // whether to call semOutbound.post() at disconnect
 protected:
     int nRefCount;
 
@@ -160,17 +158,10 @@ public:
     CCriticalSection cs_inventory;
     std::multimap<int64, CInv> mapAskFor;
 
-    // publish and subscription
-    std::vector<char> vfSubscribe;
-
-    CNode(SOCKET hSocketIn, CAddress addrIn, bool fInboundIn=false)
+    CNode(SOCKET hSocketIn, CAddress addrIn, bool fInboundIn=false) : vSend(SER_NETWORK, MIN_PROTO_VERSION), vRecv(SER_NETWORK, MIN_PROTO_VERSION)
     {
         nServices = 0;
         hSocket = hSocketIn;
-        vSend.SetType(SER_NETWORK);
-        vRecv.SetType(SER_NETWORK);
-        vSend.SetVersion(209);
-        vRecv.SetVersion(209);
         nLastSend = 0;
         nLastRecv = 0;
         nLastSendEmpty = GetTime();
@@ -181,6 +172,7 @@ public:
         nVersion = 0;
         strSubVer = "";
         fClient = false; // set by version message
+        fHasGrant = false;
         fInbound = fInboundIn;
         fNetworkNode = false;
         fSuccessfullyConnected = false;
@@ -192,7 +184,6 @@ public:
         hashLastGetBlocksEnd = 0;
         nStartingHeight = -1;
         fGetAddr = false;
-        vfSubscribe.assign(256, false);
         nMisbehavior = 0;
         setInventoryKnown.max_size(SendBufferSize() / 1000);
 
@@ -254,15 +245,19 @@ public:
 
     void AddInventoryKnown(const CInv& inv)
     {
-        CRITICAL_BLOCK(cs_inventory)
+        {
+            LOCK(cs_inventory);
             setInventoryKnown.insert(inv);
+        }
     }
 
     void PushInventory(const CInv& inv)
     {
-        CRITICAL_BLOCK(cs_inventory)
+        {
+            LOCK(cs_inventory);
             if (!setInventoryKnown.count(inv))
                 vInventoryToSend.push_back(inv);
+        }
     }
 
     void AskFor(const CInv& inv)
@@ -302,7 +297,7 @@ public:
 
     void AbortMessage()
     {
-        if (nHeaderStart == -1)
+        if (nHeaderStart < 0)
             return;
         vSend.resize(nHeaderStart);
         nHeaderStart = -1;
@@ -322,7 +317,7 @@ public:
             return;
         }
 
-        if (nHeaderStart == -1)
+        if (nHeaderStart < 0)
             return;
 
         // Set the size
@@ -347,7 +342,7 @@ public:
 
     void EndMessageAbortIfEmpty()
     {
-        if (nHeaderStart == -1)
+        if (nHeaderStart < 0)
             return;
         int nSize = vSend.size() - nMessageStart;
         if (nSize > 0)
@@ -526,8 +521,10 @@ public:
         uint256 hashReply;
         RAND_bytes((unsigned char*)&hashReply, sizeof(hashReply));
 
-        CRITICAL_BLOCK(cs_mapRequests)
+        {
+            LOCK(cs_mapRequests);
             mapRequests[hashReply] = CRequestTracker(fn, param1);
+        }
 
         PushMessage(pszCommand, hashReply);
     }
@@ -539,8 +536,10 @@ public:
         uint256 hashReply;
         RAND_bytes((unsigned char*)&hashReply, sizeof(hashReply));
 
-        CRITICAL_BLOCK(cs_mapRequests)
+        {
+            LOCK(cs_mapRequests);
             mapRequests[hashReply] = CRequestTracker(fn, param1);
+        }
 
         PushMessage(pszCommand, hashReply, a1);
     }
@@ -552,8 +551,10 @@ public:
         uint256 hashReply;
         RAND_bytes((unsigned char*)&hashReply, sizeof(hashReply));
 
-        CRITICAL_BLOCK(cs_mapRequests)
+        {
+            LOCK(cs_mapRequests);
             mapRequests[hashReply] = CRequestTracker(fn, param1);
+        }
 
         PushMessage(pszCommand, hashReply, a1, a2);
     }
@@ -599,15 +600,17 @@ public:
 inline void RelayInventory(const CInv& inv)
 {
     // Put on lists to offer to the other nodes
-    CRITICAL_BLOCK(cs_vNodes)
+    {
+        LOCK(cs_vNodes);
         BOOST_FOREACH(CNode* pnode, vNodes)
             pnode->PushInventory(inv);
+    }
 }
 
 template<typename T>
 void RelayMessage(const CInv& inv, const T& a)
 {
-    CDataStream ss(SER_NETWORK);
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss.reserve(10000);
     ss << a;
     RelayMessage(inv, ss);
@@ -616,8 +619,8 @@ void RelayMessage(const CInv& inv, const T& a)
 template<>
 inline void RelayMessage<>(const CInv& inv, const CDataStream& ss)
 {
-    CRITICAL_BLOCK(cs_mapRelay)
     {
+        LOCK(cs_mapRelay);
         // Expire old relay messages
         while (!vRelayExpiration.empty() && vRelayExpiration.front().first < GetTime())
         {
@@ -626,66 +629,12 @@ inline void RelayMessage<>(const CInv& inv, const CDataStream& ss)
         }
 
         // Save original serialized message so newer versions are preserved
-        mapRelay[inv] = ss;
+        mapRelay.insert(std::make_pair(inv, ss));
         vRelayExpiration.push_back(std::make_pair(GetTime() + 15 * 60, inv));
     }
 
     RelayInventory(inv);
 }
 
-
-
-
-
-
-
-
-//
-// Templates for the publish and subscription system.
-// The object being published as T& obj needs to have:
-//   a set<unsigned int> setSources member
-//   specializations of AdvertInsert and AdvertErase
-// Currently implemented for CTable and CProduct.
-//
-
-template<typename T>
-void AdvertStartPublish(CNode* pfrom, unsigned int nChannel, unsigned int nHops, T& obj)
-{
-    // Add to sources
-    obj.setSources.insert(pfrom->addr.ip);
-
-    if (!AdvertInsert(obj))
-        return;
-
-    // Relay
-    CRITICAL_BLOCK(cs_vNodes)
-        BOOST_FOREACH(CNode* pnode, vNodes)
-            if (pnode != pfrom && (nHops < PUBLISH_HOPS || pnode->IsSubscribed(nChannel)))
-                pnode->PushMessage("publish", nChannel, nHops, obj);
-}
-
-template<typename T>
-void AdvertStopPublish(CNode* pfrom, unsigned int nChannel, unsigned int nHops, T& obj)
-{
-    uint256 hash = obj.GetHash();
-
-    CRITICAL_BLOCK(cs_vNodes)
-        BOOST_FOREACH(CNode* pnode, vNodes)
-            if (pnode != pfrom && (nHops < PUBLISH_HOPS || pnode->IsSubscribed(nChannel)))
-                pnode->PushMessage("pub-cancel", nChannel, nHops, hash);
-
-    AdvertErase(obj);
-}
-
-template<typename T>
-void AdvertRemoveSource(CNode* pfrom, unsigned int nChannel, unsigned int nHops, T& obj)
-{
-    // Remove a source
-    obj.setSources.erase(pfrom->addr.ip);
-
-    // If no longer supported by any sources, cancel it
-    if (obj.setSources.empty())
-        AdvertStopPublish(pfrom, nChannel, nHops, obj);
-}
 
 #endif

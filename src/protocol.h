@@ -12,7 +12,6 @@
 
 #include "serialize.h"
 #include "netbase.h"
-#include "util.h"
 #include <string>
 #include "uint256.h"
 
@@ -22,15 +21,15 @@ static inline unsigned short GetDefaultPort(const bool testnet = fTestNet)
     return testnet ? 18333 : 8333;
 }
 
-//
-// Message header
-//  (4) message start
-//  (12) command
-//  (4) size
-//  (4) checksum
 
 extern unsigned char pchMessageStart[4];
 
+/** Message header.
+ * (4) message start.
+ * (12) command.
+ * (4) size.
+ * (4) checksum.
+ */
 class CMessageHeader
 {
     public:
@@ -57,11 +56,13 @@ class CMessageHeader
         unsigned int nChecksum;
 };
 
+/** nServices flags */
 enum
 {
     NODE_NETWORK = (1 << 0),
 };
 
+/** A CService with information about it as peer */
 class CAddress : public CService
 {
     public:
@@ -77,9 +78,10 @@ class CAddress : public CService
              if (fRead)
                  pthis->Init();
              if (nType & SER_DISK)
-             READWRITE(nVersion);
-             if ((nType & SER_DISK) || (nVersion >= 31402 && !(nType & SER_GETHASH)))
-             READWRITE(nTime);
+                 READWRITE(nVersion);
+             if ((nType & SER_DISK) ||
+                 (nVersion >= CADDR_TIME_VERSION && !(nType & SER_GETHASH)))
+                 READWRITE(nTime);
              READWRITE(nServices);
              READWRITE(*pip);
             )
@@ -94,9 +96,10 @@ class CAddress : public CService
         unsigned int nTime;
 
         // memory only
-        unsigned int nLastTry;
+        int64 nLastTry;
 };
 
+/** inv message data */
 class CInv
 {
     public:
